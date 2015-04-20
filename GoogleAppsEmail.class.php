@@ -125,7 +125,7 @@ class GoogleAppsEmail {
         // from previous implementation.
         if (!empty($results['sendas']->feed->entry)) {
           $additional_default = false;
-    
+
           foreach ($results['sendas']->feed->entry as $k => $v) {
             foreach ($v->{'apps$property'} as $w) {
               $additional_sendas[$k][$w->name] = $w->value;
