@@ -13,16 +13,16 @@ class GoogleAppsEmail {
      */
     public static function _query($logonid) {
 
-        // Get secrets file.
+        // Get secrets file.  This contains OAuth2.0 secrets
         $file = file_get_contents("bol_secrets.json");
         $json = (object)json_decode($file, true);
 
-        // Init Google Directory API auth
+        // Authenticate with Google Directory API, and start a Directory API client.
         $client = new Google_Client();
         $client->setApplicationName("BOL Directory API");
         $service = new Google_Service_Directory($client);
 
-        // Reuse Token
+        // Reuse Token if it's available.
         if (isset($_SESSION['service_token'])) {
             $client->setAccessToken($_SESSION['service_token']);
         }
@@ -41,9 +41,11 @@ class GoogleAppsEmail {
             $client->getAuth()->refreshTokenWithAssertion($cred);
         }
 
-        // Save session
+        // Save session.
         $_SESSION['service_token'] = $client->getAccessToken();
 
+        // Try to get directory data for a user.  This will fail if the
+        // user does not exist.
         try {
             $user = $service->users->get($logonid . '@g.ucla.edu');
 
@@ -51,18 +53,21 @@ class GoogleAppsEmail {
             return array('Errors' => $err->getMessage());
         }
 
-        // Set up the Email Settings API
+        // The uses exists, so now we can set up Email Settings API authentication.
 
-        // Reuse Client Access Token.
+        // We'll reuse the token.
         $json = json_decode($client->getAccessToken());
         $token = $json->access_token;
         $auth = "Authorization: Bearer=" . $token;
 
+        // This is re-used code.  The Email Settings API does not have a a `google-api-php-client` Service,
+        // so we use curl to get data.  Note that we pass in the 'access_token' in the URL.
         $nodes = array();
         foreach (array('sendas', 'forwarding', 'pop', 'imap', 'vacation', 'delegation') as $setting_id) {
             $nodes[$setting_id] = sprintf("https://apps-apis.google.com/a/feeds/emailsettings/2.0/g.ucla.edu/%s/%s?alt=json&access_token=%s", $logonid, $setting_id, $token);
         }
 
+        // Set up the curl request.
         $errors = array();
         $curl_array = array();
 
@@ -101,151 +106,153 @@ class GoogleAppsEmail {
         }
         curl_multi_close($mh);
 
+        // If we hit any errors here, stop execution.
         if (!empty($errors)) {
             return array('Errors' => $errors);
         }
 
-        // Finally, we have a result...
-
-        // Prepare response.
+        // Finally, we have a result...  we can start to prepare response.
         $r = array();
 
+        // This data is from the Directory API
         $r['username'] = $logonid;
         $r['fullname'] = $user->name->familyName . ", " . $user->name->givenName;
         $r['suspended'] = $user->suspended;
 
         $r['sendas'] = array($logonid . '@g.ucla.edu');
 
-    if (!empty($results['sendas']->feed->entry)) {
-      $additional_default = false;
-
-      foreach ($results['sendas']->feed->entry as $k => $v) {
-        foreach ($v->{'apps$property'} as $w) {
-          $additional_sendas[$k][$w->name] = $w->value;
-        }
-      }
-
-      foreach ($additional_sendas as $v) {
-        $temp = '';
-
-        if ($v['verified'] != 'true') {
-          $temp .= '[Unverified] ';
-        }
-
-        if ($v['isDefault'] == 'true') {
-          $additional_default = true;
-          $temp .= '[Default] ';
-        }
-
-        $temp .= $v['name'] . ' &lt;' . $v['address'] . '&gt;';
-
-        if (!empty($v['replyTo'])) {
-          $temp .= ' (Reply-to: ' . $v['replyTo'] . ')';
-        }
-
-        $r['sendas'][] .= $temp;
-      }
-
-      if (!$additional_default) {
-        $r['sendas'][0] .= ' [Default]';
-      }
-    }
-
-    $r['pop'] = 'Disabled';
-
-    if (!empty($results['pop']->entry->{'apps$property'})) {
-      foreach ($results['pop']->entry->{'apps$property'} as $v) {
-        if ($v->name == 'enable') {
-          if ($v->value == 'true') {
-            $r['pop'] = 'Enabled';
-          }
-        } elseif ($v->name == 'action') {
-          $pop_action = ' (Action: ' . $v->value . ')';
-        }
-      }
-
-      if ($r['pop'] == 'Enabled') {
-        $r['pop'] .= $pop_action;
-      }
-    }
+        // This following data is from the Email Settings API.  The code below is
+        // from previous implementation.
+        if (!empty($results['sendas']->feed->entry)) {
+          $additional_default = false;
     
-    $r['imap'] = 'Disabled';
+          foreach ($results['sendas']->feed->entry as $k => $v) {
+            foreach ($v->{'apps$property'} as $w) {
+              $additional_sendas[$k][$w->name] = $w->value;
+            }
+          }
 
-    if (!empty($results['imap']->entry->{'apps$property'})) {
-      foreach ($results['imap']->entry->{'apps$property'} as $v) {
-        if ($v->name == 'enable' && $v->value == 'true') {
-          $r['imap'] = 'Enabled';
-          break;
-        }
-      }
-    }
+          foreach ($additional_sendas as $v) {
+            $temp = '';
 
-    $r['forwarding'] = 'Disabled';
+            if ($v['verified'] != 'true') {
+              $temp .= '[Unverified] ';
+            }
 
-    if (!empty($results['forwarding']->entry->{'apps$property'})) {
-      $forwarding_on = false;
-      foreach ($results['forwarding']->entry->{'apps$property'} as $v) {
-        if ($v->name == 'enable' && $v->value == 'true') {
-          $forwarding_on = true;
-          continue;
-        }
-        $forwarding_settings[$v->name] = $v->value;
-      }
-      if ($forwarding_on) {
-        $r['forwarding'] = array($forwarding_settings['forwardTo'] . ' (Action: ' . $forwarding_settings['action'] . ')');
-      }
-    }
+            if ($v['isDefault'] == 'true') {
+              $additional_default = true;
+              $temp .= '[Default] ';
+            }
 
-    $r['vacation'] = 'Disabled';
+            $temp .= $v['name'] . ' &lt;' . $v['address'] . '&gt;';
 
-    if (!empty($results['vacation']->entry->{'apps$property'})) {
-      foreach ($results['vacation']->entry->{'apps$property'} as $v) {
-        $vacation_settings[$v->name] = $v->value;
-      }
+            if (!empty($v['replyTo'])) {
+              $temp .= ' (Reply-to: ' . $v['replyTo'] . ')';
+            }
 
-      if ($vacation_settings['enable'] == 'true') {
-        $temp = array();
-        $temp[] = 'Start: ' . $vacation_settings['startDate'];
-        if (!empty($vacation_settings['endDate'])) {
-          $temp[] = 'End: ' . $vacation_settings['endDate'];
+            $r['sendas'][] .= $temp;
+          }
+
+          if (!$additional_default) {
+            $r['sendas'][0] .= ' [Default]';
+          }
         }
 
-        if ($vacation_settings['contactsOnly'] == 'true') {
-          $temp[] = '+Only send to people in Contacts';
+        $r['pop'] = 'Disabled';
+
+        if (!empty($results['pop']->entry->{'apps$property'})) {
+          foreach ($results['pop']->entry->{'apps$property'} as $v) {
+            if ($v->name == 'enable') {
+              if ($v->value == 'true') {
+                $r['pop'] = 'Enabled';
+              }
+            } elseif ($v->name == 'action') {
+              $pop_action = ' (Action: ' . $v->value . ')';
+            }
+          }
+
+          if ($r['pop'] == 'Enabled') {
+            $r['pop'] .= $pop_action;
+          }
         }
 
-        if ($vacation_settings['domainOnly'] == 'true') {
-          $temp[] = '+Only send to people in UCLA';
+        $r['imap'] = 'Disabled';
+
+        if (!empty($results['imap']->entry->{'apps$property'})) {
+          foreach ($results['imap']->entry->{'apps$property'} as $v) {
+            if ($v->name == 'enable' && $v->value == 'true') {
+              $r['imap'] = 'Enabled';
+              break;
+            }
+          }
         }
 
-        $temp[] = 'Subject: ' . $vacation_settings['subject'];
-        $temp[] = 'Message: ' . $vacation_settings['message'];
+        $r['forwarding'] = 'Disabled';
 
-        $r['vacation'] = $temp;
-      }
-    }
-
-    $r['delegation'] = array('Disabled');
-
-    if (!empty($results['delegation']->feed->entry)) {
-      $r['delegation'] = array();
-
-      foreach ($results['delegation']->feed->entry as $k => $v) {
-        foreach ($v->{'apps$property'} as $w) {
-          $r['delegation'][$k][$w->name] = trim($w->value);
+        if (!empty($results['forwarding']->entry->{'apps$property'})) {
+          $forwarding_on = false;
+          foreach ($results['forwarding']->entry->{'apps$property'} as $v) {
+            if ($v->name == 'enable' && $v->value == 'true') {
+              $forwarding_on = true;
+              continue;
+            }
+            $forwarding_settings[$v->name] = $v->value;
+          }
+          if ($forwarding_on) {
+            $r['forwarding'] = array($forwarding_settings['forwardTo'] . ' (Action: ' . $forwarding_settings['action'] . ')');
+          }
         }
-      }
 
-      foreach ($r['delegation'] as &$v) {
-        $temp = '';
-        if (!empty($v['delegate'])) {
-          $temp = $v['delegate'] . ' ';
+        $r['vacation'] = 'Disabled';
+
+        if (!empty($results['vacation']->entry->{'apps$property'})) {
+          foreach ($results['vacation']->entry->{'apps$property'} as $v) {
+            $vacation_settings[$v->name] = $v->value;
+          }
+
+          if ($vacation_settings['enable'] == 'true') {
+            $temp = array();
+            $temp[] = 'Start: ' . $vacation_settings['startDate'];
+            if (!empty($vacation_settings['endDate'])) {
+              $temp[] = 'End: ' . $vacation_settings['endDate'];
+            }
+
+            if ($vacation_settings['contactsOnly'] == 'true') {
+              $temp[] = '+Only send to people in Contacts';
+            }
+
+            if ($vacation_settings['domainOnly'] == 'true') {
+              $temp[] = '+Only send to people in UCLA';
+            }
+
+            $temp[] = 'Subject: ' . $vacation_settings['subject'];
+            $temp[] = 'Message: ' . $vacation_settings['message'];
+
+            $r['vacation'] = $temp;
+          }
         }
-        $v = sprintf('%s<%s> (Status: %s)', $temp, $v['address'], $v['status']);
-      }
-    }
 
-    return $r;
+        $r['delegation'] = array('Disabled');
+
+        if (!empty($results['delegation']->feed->entry)) {
+          $r['delegation'] = array();
+
+          foreach ($results['delegation']->feed->entry as $k => $v) {
+            foreach ($v->{'apps$property'} as $w) {
+              $r['delegation'][$k][$w->name] = trim($w->value);
+            }
+          }
+
+          foreach ($r['delegation'] as &$v) {
+            $temp = '';
+            if (!empty($v['delegate'])) {
+              $temp = $v['delegate'] . ' ';
+            }
+            $v = sprintf('%s<%s> (Status: %s)', $temp, $v['address'], $v['status']);
+          }
+        }
+
+        return $r;
   }
 }
 
