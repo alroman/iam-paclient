@@ -1,2 +1,5 @@
 BOLQUERY*
 old_api.php
+.idea
+bol_secrets.json
+
