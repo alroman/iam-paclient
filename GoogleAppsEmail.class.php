@@ -3,6 +3,8 @@
  * Provides method for querying Google Apps email account information
  */
 
+require_once 'google-api-php-client/src/Google/autoload.php';
+
 class GoogleAppsEmail {
 
     /**
@@ -13,7 +15,7 @@ class GoogleAppsEmail {
 
         // Get secrets file.
         $file = file_get_contents("bol_secrets.json");
-        $json = json_decode($file, true);
+        $json = (object)json_decode($file, true);
 
         // Init Google Directory API auth
         $client = new Google_Client();
@@ -28,7 +30,7 @@ class GoogleAppsEmail {
         $key = file_get_contents($json->client_key_path);
         $cred = new Google_Auth_AssertionCredentials(
             $json->client_email,
-            array($json->client_scope),
+            array($json->client_scope, 'https://apps-apis.google.com/a/feeds/emailsettings/2.0/'),
             $key,
             'notasecret',
             'http://oauth.net/grant_type/jwt/1.0/bearer',
@@ -42,25 +44,77 @@ class GoogleAppsEmail {
         // Save session
         $_SESSION['service_token'] = $client->getAccessToken();
 
-        $results = array();
-
         try {
-            $user = $logonid;
-            $results = $service->users->get('alroman@g.ucla.edu');
+            $user = $service->users->get($logonid . '@g.ucla.edu');
 
         } catch (Exception $err) {
             return array('Errors' => $err->getMessage());
         }
 
-        // We have a result...
+        // Set up the Email Settings API
 
+        // Reuse Client Access Token.
+        $json = json_decode($client->getAccessToken());
+        $token = $json->access_token;
+        $auth = "Authorization: Bearer=" . $token;
+
+        $nodes = array();
+        foreach (array('sendas', 'forwarding', 'pop', 'imap', 'vacation', 'delegation') as $setting_id) {
+            $nodes[$setting_id] = sprintf("https://apps-apis.google.com/a/feeds/emailsettings/2.0/g.ucla.edu/%s/%s?alt=json&access_token=%s", $logonid, $setting_id, $token);
+        }
+
+        $errors = array();
+        $curl_array = array();
+
+        $mh = curl_multi_init();
+        foreach ($nodes as $i => $url) {
+            $curl_array[$i] = curl_init($url);
+            curl_setopt($curl_array[$i], CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($curl_array[$i], CURLOPT_HTTPHEADER, array($auth));
+            curl_multi_add_handle($mh, $curl_array[$i]);
+        }
+
+        $running = NULL;
+
+        do {
+            usleep(10000);
+            curl_multi_exec($mh, $running);
+        } while ($running > 0);
+
+        $results = array();
+        foreach ($nodes as $i => $url) {
+            $http_code = curl_getinfo($curl_array[$i], CURLINFO_HTTP_CODE);
+            if ($http_code == 200) {
+                $results[$i] = json_decode(curl_multi_getcontent($curl_array[$i]));
+            } else {
+                $response = curl_multi_getcontent($curl_array[$i]);
+                var_dump($response);
+                @$xml = simplexml_load_string($response);
+                if (!$xml) {
+                    $reason = htmlentities($response);
+                } else {
+                    $reason = htmlentities($xml->error['reason']);
+                }
+                $errors['Error ' . $http_code] = $reason;
+            }
+            curl_multi_remove_handle($mh, $curl_array[$i]);
+        }
+        curl_multi_close($mh);
+
+        if (!empty($errors)) {
+            return array('Errors' => $errors);
+        }
+
+        // Finally, we have a result...
+
+        // Prepare response.
         $r = array();
 
-    $r['username'] = $results['account']->entry->{'apps$login'}->userName;
-    $r['fullname'] = sprintf('%s, %s', $results['account']->entry->{'apps$name'}->familyName, $results['account']->entry->{'apps$name'}->givenName);
-    $r['suspended'] = $results['account']->entry->{'apps$login'}->suspended;
+        $r['username'] = $logonid;
+        $r['fullname'] = $user->name->familyName . ", " . $user->name->givenName;
+        $r['suspended'] = $user->suspended;
 
-    $r['sendas'] = array($results['account']->entry->{'apps$login'}->userName . '@g.ucla.edu');
+        $r['sendas'] = array($logonid . '@g.ucla.edu');
 
     if (!empty($results['sendas']->feed->entry)) {
       $additional_default = false;
